@@ -1,1 +1,1 @@
-uvicorn main:app --app-dir src --reload
+call .venv\Scripts\activate.bat && uvicorn src.main:app --reload

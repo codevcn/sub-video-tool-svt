@@ -1,17 +1,31 @@
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-from src.routes.video_route import router as video_router
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-app = FastAPI(title="YouTube Subtitle Tool")
+from src.routes.api.video_route import router as video_router
 
-# 1. Cấu hình phục vụ file tĩnh (CSS, JS, Images)
-# Người dùng có thể truy cập qua: http://localhost:8000/static/...
-app.mount("/static", StaticFiles(directory="public"), name="static")
+app = FastAPI(
+    title="YtoSub Server",
+    description="API dịch phụ đề YouTube từ tiếng Anh sang tiếng Việt bằng Gemini AI.",
+    version="1.0.0",
+)
 
-# 2. Nhúng router từ thư mục routes vào app chính
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(video_router)
 
 
-@app.get("/")
-async def root():
-    return {"message": "Welcome to Subtitle Tool API. Go to /docs for more info."}
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    if exc.status_code == 404:
+        return JSONResponse(
+            status_code=404,
+            content={"message": f"Route '{request.url.path}' không tồn tại."},
+        )
+    return JSONResponse(status_code=exc.status_code, content={"message": str(exc.detail)})

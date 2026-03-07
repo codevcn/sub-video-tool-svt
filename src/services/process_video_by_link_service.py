@@ -1,50 +1,25 @@
-from pathlib import Path
-import os
-from google import genai
-from youtube_transcript_api import YouTubeTranscriptApi
 import json
+import os
 import re
 import time
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 from google import genai
 from google.genai import types
-from pathlib import Path
-from src.config.config import root_dir
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._transcripts import FetchedTranscript
+from src.configs.app_configs import AppSettings, root_dir
 
 
-class VideoService:
-    def __init__(self):
-        # 1. Cấu hình Client cho Gemini theo chuẩn SDK mới (google-genai)
-        GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-        if not GEMINI_API_KEY:
-            print("Lỗi: Biến môi trường GEMINI_API_KEY chưa được thiết lập.")
-            raise ValueError("GEMINI_API_KEY is required in environment variables.")
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+class ProcessVideoByLinkService:
+    def __init__(self, settings: AppSettings) -> None:
+        self._client = genai.Client(api_key=settings.gemini_api_key)
+        self._gemini_model: str = settings.gemini_model
+        self._translate_chunk_size: int = settings.translate_chunk_size
 
-        # Sử dụng mô hình mới nhất để tối ưu khả năng dịch thuật và xử lý JSON
-        GEMINI_MODEL = os.getenv("GEMINI_MODEL")
-        if not GEMINI_MODEL:
-            print("Lỗi: Biến môi trường GEMINI_MODEL chưa được thiết lập.")
-            raise ValueError("GEMINI_MODEL is required in environment variables.")
-
-        TRANSLATE_CHUNK_SIZE = int(os.getenv("TRANSLATE_CHUNK_SIZE", 0))
-        if TRANSLATE_CHUNK_SIZE <= 0:
-            print(
-                "Cảnh báo: Biến môi trường TRANSLATE_CHUNK_SIZE không hợp lệ hoặc không được thiết lập."
-            )
-            raise ValueError(
-                "TRANSLATE_CHUNK_SIZE is required in environment variables."
-            )
-
-        self.GEMINI_MODEL = GEMINI_MODEL
-        self.TRANSLATE_CHUNK_SIZE = TRANSLATE_CHUNK_SIZE
-
-    def get_youtube_subtitle(self, video_id):
+    def get_youtube_subtitle(self, video_id: str) -> FetchedTranscript | None:
         """Tải phụ đề tiếng Anh từ YouTube."""
         try:
             print("Đang tải phụ đề gốc...")
-            # LƯU Ý: YouTubeTranscriptApi trả về một danh sách các từ điển (list of dicts).
-            # Do đó, ta cần sử dụng cú pháp chuẩn của thư viện là get_transcript.
             api = YouTubeTranscriptApi()
             transcript = api.fetch(video_id, languages=["en"])
             return transcript
@@ -52,7 +27,7 @@ class VideoService:
             print(f"Lỗi khi tải phụ đề: {e}")
             return None
 
-    def format_time(self, seconds):
+    def format_time(self, seconds: float) -> str:
         """Chuyển đổi giây sang định dạng thời gian chuẩn của SRT."""
         td = float(seconds)
         hours = int(td // 3600)
@@ -62,21 +37,7 @@ class VideoService:
         return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
     def load_summary(self, youtube_video_link: str) -> str | None:
-        """Đọc nội dung tóm tắt phim từ file, hoặc yêu cầu Gemini tóm tắt nếu chưa có."""
-        summary_path = root_dir / "input" / "video_summary.md"
-
-        # 1. Kiểm tra xem file đã tồn tại và có nội dung hay chưa
-        if summary_path.exists():
-            content = summary_path.read_text(encoding="utf-8").strip()
-            if content:
-                print("Đã tìm thấy bản tóm tắt có sẵn trong file video_summary.md.")
-                return content
-
-        if not self.GEMINI_MODEL:
-            print("Lỗi: Biến môi trường GEMINI_MODEL chưa được thiết lập.")
-            return None
-
-        # 2. Nếu không có file hoặc file rỗng, gọi API để yêu cầu tóm tắt
+        """Yêu cầu Gemini tóm tắt phim."""
         prompt = f"""
         Bạn hãy tóm tắt nội dung của video YouTube tại đường dẫn sau: {youtube_video_link}
         
@@ -92,12 +53,12 @@ class VideoService:
             print(f"Đang gửi yêu cầu tóm tắt video {youtube_video_link} đến Gemini...")
 
             # Gọi API để tạo nội dung tóm tắt
-            response = self.client.models.generate_content(
-                model=self.GEMINI_MODEL, contents=prompt
+            response = self._client.models.generate_content(
+                model=self._gemini_model, contents=prompt
             )
 
             # Kiểm tra xem API có trả về văn bản hợp lệ hay không
-            summary_text = response.text
+            summary_text: str | None = response.text
             if summary_text:
                 print("Đã nhận được bản tóm tắt từ Gemini thành công.")
                 return summary_text
@@ -113,13 +74,15 @@ class VideoService:
             return None
 
     def translate_chunk(
-        self, chunk_data, summary: str | None = None, max_retries: int = 3
-    ):
+        self, chunk_data: list, summary: str | None = None, max_retries: int = 3
+    ) -> list | None:
         """Dịch một cụm nhỏ phụ đề, không dùng lịch sử chat để tránh tràn token."""
-        payload = [{"id": i, "text": item.text} for i, item in enumerate(chunk_data)]
+        payload: list[dict] = [
+            {"id": i, "text": item.text} for i, item in enumerate(chunk_data)
+        ]
 
         # Ghép bản tóm tắt trực tiếp vào ngữ cảnh của câu lệnh
-        context_text = (
+        context_text: str = (
             f"Tóm tắt phim (dùng để tham khảo bối cảnh phim):\n{summary}\n\n"
             if summary
             else ""
@@ -136,15 +99,12 @@ class VideoService:
         Dữ liệu cần dịch:
         {json.dumps(payload, ensure_ascii=False)}
         """
-        if not self.GEMINI_MODEL:
-            print("Lỗi: Biến môi trường GEMINI_MODEL chưa được thiết lập.")
-            return None
 
         for attempt in range(1, max_retries + 1):
             try:
                 # Gọi API dạng stateless (không lưu lịch sử) thay vì dùng chat
-                response = self.client.models.generate_content(
-                    model=self.GEMINI_MODEL,
+                response = self._client.models.generate_content(
+                    model=self._gemini_model,
                     contents=translate_prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json"
@@ -153,14 +113,14 @@ class VideoService:
 
                 if response.text is None:
                     raise ValueError("API trả về phản hồi rỗng.")
-                result = json.loads(response.text)
+                result: list = json.loads(response.text)
                 if len(result) != len(chunk_data):
                     raise ValueError(
                         f"Số dòng trả về ({len(result)}) không khớp ({len(chunk_data)})."
                     )
                 return result
             except Exception as e:
-                err_str = str(e)
+                err_str: str = str(e)
                 print(f"  Lần thử {attempt}/{max_retries} thất bại: {e}")
 
                 # Nếu model không có free tier (limit: 0), không cần retry thêm
@@ -175,19 +135,23 @@ class VideoService:
                     match = re.search(
                         r"retry[\w\s]*in[\s]+(\d+)", err_str, re.IGNORECASE
                     )
-                    wait = int(match.group(1)) + 5 if match else 65 * attempt
+                    wait: int = int(match.group(1)) + 5 if match else 65 * attempt
                     print(f"  Chờ {wait}s trước khi thử lại...")
                     time.sleep(wait)
 
         return None
 
     def process_and_save_srt(
-        self, original_data, filename: str, youtube_video_link: str
-    ):
+        self,
+        original_data: FetchedTranscript,
+        filename: str,
+        youtube_video_link: str,
+        video_summary: str | None = None,
+    ) -> None:
         """Xử lý chia nhỏ dữ liệu, dịch và lưu thành file SRT."""
-        translated_subtitles = []
+        translated_subtitles: list = []
 
-        summary = self.load_summary(youtube_video_link)
+        summary: str | None = video_summary or self.load_summary(youtube_video_link)
         if summary:
             print(
                 "Đã tải bản tóm tắt phim. Sẽ dùng bản tóm tắt làm ngữ cảnh cho từng cụm."
@@ -195,13 +159,14 @@ class VideoService:
         else:
             print("Không có bản tóm tắt phim. Sẽ dịch mà không có ngữ cảnh phim.")
 
-        total_lines = len(original_data)
+        total_lines: int = len(original_data)
+        snippets: list = list(original_data)
         print(f"Tổng cộng có {total_lines} dòng phụ đề. Bắt đầu quá trình dịch...")
 
-        for i in range(0, total_lines, self.TRANSLATE_CHUNK_SIZE):
-            chunk = original_data[i : i + self.TRANSLATE_CHUNK_SIZE]
+        for i in range(0, total_lines, self._translate_chunk_size):
+            chunk: list = snippets[i : i + self._translate_chunk_size]
             print(
-                f"Đang xử lý dòng {i + 1} đến {min(i + self.TRANSLATE_CHUNK_SIZE, total_lines)}..."
+                f"Đang xử lý dòng {i + 1} đến {min(i + self._translate_chunk_size, total_lines)}..."
             )
 
             # Truyền trực tiếp summary vào hàm dịch
@@ -215,7 +180,7 @@ class VideoService:
                     f"Cảnh báo: Chunk {i+1} thất bại sau {3} lần thử. Giữ nguyên tiếng Anh."
                 )
                 # Fallback: Nếu AI trả về lỗi, giữ nguyên bản gốc để không làm hỏng file
-                fallback_chunk = [{"text": item.text} for item in chunk]
+                fallback_chunk: list[dict] = [{"text": item.text} for item in chunk]
                 translated_subtitles.extend(fallback_chunk)
 
             # Tạm nghỉ 4 giây giữa các lần gọi để đảm bảo an toàn cho gói miễn phí (tránh vượt rate limit)
@@ -228,9 +193,9 @@ class VideoService:
             for index, (orig, trans) in enumerate(
                 zip(original_data, translated_subtitles)
             ):
-                start_time = self.format_time(orig.start)
-                end_time = self.format_time(orig.start + orig.duration)
-                translated_text = trans.get("text", orig.text)
+                start_time: str = self.format_time(orig.start)
+                end_time: str = self.format_time(orig.start + orig.duration)
+                translated_text: str = trans.get("text", orig.text)
 
                 f.write(
                     f"{index + 1}\n{start_time} --> {end_time}\n{translated_text}\n\n"
@@ -249,21 +214,13 @@ class VideoService:
         if parsed.hostname in ("www.youtube.com", "youtube.com"):
             if parsed.path == "/watch":
                 # Hỗ trợ: https://www.youtube.com/watch?v=EKgy5EM-Vhw
-                return parse_qs(parsed.query)["v"][0]
+                query_params = parse_qs(parsed.query)
+                video_id = query_params.get("v", [None])[0]
+                if video_id:
+                    return video_id
+                raise ValueError(
+                    f"Không tìm thấy tham số 'v' chứa Video ID trong URL: {url}"
+                )
             if parsed.path.startswith("/embed/"):
                 return parsed.path.split("/")[2]
         raise ValueError(f"Không nhận ra URL YouTube: {url}")
-
-    def load_video_link_from_input(self, config_path: str | None = None) -> str:
-        """Đọc đường dẫn video YouTube từ file cấu hình."""
-        if config_path is None:
-            config_path = os.path.join(root_dir, "input", "video_config.txt")
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("youtube_video_link"):
-                        return line.split("=", 1)[1].strip()
-            raise ValueError(f"Không tìm thấy 'youtube_video_link' trong {config_path}")
-        except Exception as e:
-            print(f"Lỗi khi đọc file cấu hình: {e}")
-            exit(1)
